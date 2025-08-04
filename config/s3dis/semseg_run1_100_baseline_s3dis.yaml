@@ -1,0 +1,142 @@
+GENERAL:
+  task: train
+  manual_seed: 123
+  model_dir: model/semseg/semseg.py
+  dataset_dir: data/s3dis.py
+
+DATA:
+  normalize_mode: randla
+  data_root: dataset
+  dataset: s3dis
+  cache: True
+  crop_size: [5.0, 5.0]  # 匹配参考实现的块大小
+  num_points: 40960      # 保持与原始一致
+  crop_max_iters: 100    # 增加尝试次数
+  test_area: Area_5
+  train_area: Area_[1-4,6]
+
+  input_channel: 3
+  classes: 13
+  ignore_label: -100
+
+  scale: 50
+  full_scale: [64, 512]
+
+  train_flip: True
+  train_rot: True
+  train_jit: True
+  train_elas: True
+  train_subsample: True
+  subsample_voxel_size: 0.015
+
+STRUCTURE:
+  model_name: semantic_semi
+
+  nPlanes: [ 16, 64, 128, 256, 512 ]  # 严格匹配参考实现的通道配置
+  m: 8
+  block_residual: True
+  block_reps: 2
+  downsample_padding: 1
+
+  embed_m: 32
+  preprocess_num_points: 40960   #40960
+  num_neighbors: 16
+  decimation: 4
+  num_points: 40960
+
+TRAIN:
+  iters: 32000
+  train_workers: 2 # data loader workers
+  optim: Adam # Adam or SGD
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 0.001
+
+  save_freq: 50
+  keep_freq: 250
+  keep_last_ratio: 0.96
+  eval_freq: 250
+  eval_last_ratio: 0.96
+
+  batch_size: 4
+
+  pretrain_path:
+  pretrain_module: []
+
+  validation: True
+
+#  scheduler: StepLR
+#  step_size: 3000     # 50%处衰减
+#  step_gamma: 0.5           # 衰减率
+#  scheduler: ExpLR          # 指定使用指数衰减
+#  exp_step_size: 102         # 设置为每个epoch的迭代次数
+#  exp_gamma: 0.95           # 设置每个epoch的衰减率
+#  scheduler: OneCycleLR
+#  # OneCycleLR
+#  oc_max_lr: 0.02
+#  oc_pct_start: 0.4
+#  oc_anneal_strategy: cos
+#  oc_div_factor: 10.0
+#  oc_final_div_factor: 10000.0
+
+#  scheduler: CosineAnnealingLR
+#  # CosineAnnealingLR 的参数
+#  lr_t_max: 32000      # T_max, 必须设置为总迭代次数
+#  lr_eta_min: 1e-6     # 学习率能衰减到的最小值
+#  # Warmup 的参数
+#  warmup: True
+#  warmup_iter: 500     # 预热的迭代次数，例如500次
+
+
+  scheduler: OneCycleLR
+  # OneCycleLR
+  oc_max_lr: 0.02
+  oc_pct_start: 0.4
+  oc_anneal_strategy: cos
+  oc_div_factor: 10.0
+  oc_final_div_factor: 10000.0
+
+
+#  scheduler: OneCycleLR
+#
+#  # OneCycleLR 的参数
+#  oc_max_lr: 0.01          # 学习率能达到的最顶峰，通常设为您用Adam时的初始学习率
+#  oc_pct_start: 0.3        # 学习率上升阶段占总迭代次数的百分比，例如30%
+#  oc_anneal_strategy: cos  # 学习率下降的策略，cos(余弦)通常效果最好
+#  oc_div_factor: 25.0      # 初始学习率 = max_lr / div_factor
+#  oc_final_div_factor: 10000.0 # 最低学习率 = 初始学习率 / final_div_factor
+
+
+UNSUP:
+  semi: True
+  labeled_ratio: 1
+
+  prepare_iter: 200
+
+  # data
+  crop_size: [4, 4]
+  crop_max_iters: 50
+
+  # loss
+  num_pos_sample: 1000
+  num_neg_sample: 10000
+  bank_length: 10000
+  max_num_enqueue_per_class: 1000
+  conf_thresh: 0.75
+
+  temp: 0.1
+  mem_batch_size: 500
+
+  loss_weight: [1.0, 0.1] # sup_loss, unsup_loss
+
+TEST:
+  split: val
+  test_reps: 3
+  test_iter: 30000
+  test_workers: 2
+
+  eval: True
+  save_semantic: False
+
+DISTRIBUTE:
+  sync_bn: True
