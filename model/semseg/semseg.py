@@ -15,6 +15,7 @@ from util import utils
 # from model.unet.pointnet2_unet import PointNet2UNet
 from model.unet.randlanetnew import RandLANetUNet
 from model.unet.helper_tool import DataProcessing as  DP
+from model.unet.stratified_transformer import StratifiedTransformer, create_stratified_transformer
 
 
 from util.pointdata_process import get_pos_sample_idx, get_neg_sample, split_embed
@@ -202,23 +203,47 @@ class SemSeg(nn.Module):
         self.pretrain_path = cfg.pretrain_path
         self.pretrain_module = cfg.pretrain_module
 
-        # nPlanes = [m, 2 * m, 3 * m, 4 * m]
-        # 使用您提供的 RandLANetUNet
-        # self.backbone = RandLANetUNet(input_c, m, nPlanes, cfg)
-        nPlanes = [m, 2*m, 3*m, 4*m,5*m]  # 保持原有配置
-        self.backbone = RandLANetUNet(input_c, m, nPlanes, cfg)
+        # Choose backbone architecture based on config
+        self.backbone_type = getattr(cfg, 'backbone_type', 'randlanet')  # Default to randlanet
+        
+        if self.backbone_type == 'stratified_transformer':
+            print(f"[INFO] Using StratifiedTransformer backbone")
+            self.backbone = create_stratified_transformer(cfg)
+            # For transformer, the output dimension might be different
+            # The transformer directly outputs class predictions, so we need to adjust
+            backbone_output_dim = classes  # Transformer outputs directly to classes
+        else:
+            print(f"[INFO] Using RandLANetUNet backbone")
+            # nPlanes = [m, 2 * m, 3 * m, 4 * m]
+            # 使用您提供的 RandLANetUNet
+            # self.backbone = RandLANetUNet(input_c, m, nPlanes, cfg)
+            nPlanes = [m, 2*m, 3*m, 4*m,5*m]  # 保持原有配置
+            self.backbone = RandLANetUNet(input_c, m, nPlanes, cfg)
+            backbone_output_dim = m
 
-        # 增强分类头
-        self.projector = nn.Sequential(
-            nn.Linear(m, m),
-            nn.ReLU(),
-            nn.Linear(m, embed_m)
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(m, m),
-            nn.ReLU(),
-            nn.Linear(m, classes)
-        )
+        # 增强分类头 - adjust based on backbone
+        if self.backbone_type == 'stratified_transformer':
+            # For transformer, we might not need additional projection layers
+            # as the transformer can directly output features
+            self.projector = nn.Sequential(
+                nn.Linear(backbone_output_dim, embed_m),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
+            # Classifier is integrated into the transformer
+            self.classifier = nn.Identity()  # No-op since transformer handles classification
+        else:
+            # Original setup for RandLANet
+            self.projector = nn.Sequential(
+                nn.Linear(backbone_output_dim, backbone_output_dim),
+                nn.ReLU(),
+                nn.Linear(backbone_output_dim, embed_m)
+            )
+            self.classifier = nn.Sequential(
+                nn.Linear(backbone_output_dim, backbone_output_dim),
+                nn.ReLU(),
+                nn.Linear(backbone_output_dim, classes)
+            )
 
         # self.projector = nn.Linear(m, embed_m)
         # self.classifier = nn.Linear(m, classes)
@@ -260,54 +285,126 @@ class SemSeg(nn.Module):
             m.bias.data.fill_(0.0)
 
     def encoder(self, batch):
-        # # 1. 数据已经由 get_batch_data 准备好，直接使用
-        # coords_float = batch['locs_float'].cuda()  # (N_total, 3)
-        # input_features = batch['feats'].cuda()  # (N_total, 6) <--- 已经是6维了！
-        #
-        # # 2. 高效地准备送入 backbone 的数据
-        # batch_size = len(batch['offsets']) - 1
-        # # 从模型获取期望点数，例如 40960
-        # # 您需要确保在 RandLANetUNet 的 __init__ 中有 self.num_points = num_points
-        # num_points = self.backbone.num_points
-        #
-        # # 将坐标重塑为 (B, N, 3)
-        # xyz = coords_float.view(batch_size, num_points, 3)
-        #
-        # # 将6维特征重塑为 (B, C, N) 以匹配 Conv1d 的输入
-        # features_6d = input_features.view(batch_size, num_points, 6).permute(0, 2, 1)
-        #
-        # # 创建一个干净的字典送入 backbone
-        # net_batch = {'xyz': xyz, 'features': features_6d}
-        #
-        # # 3. 调用 backbone
-        # out_feats_padded = self.backbone(net_batch)  # (B, C_out, 40960)
-        #
-        # # 4. 将批处理的输出重新变回平铺的张量
-        # output_features = out_feats_padded.permute(0, 2, 1).contiguous().view(-1, out_feats_padded.shape[1])
-        #
-        # return output_features
-        # batch 字典由 collate_fn 准备好，直接送入 backbone
-        # backbone 输出 (B, m, N)
-        output_features_bmn = self.backbone(batch)
+        """
+        Enhanced encoder method that handles both RandLANet and StratifiedTransformer
+        This addresses the data flow mismatch and batch processing issues
+        """
+        try:
+            if self.backbone_type == 'stratified_transformer':
+                # Handle StratifiedTransformer with proper data preprocessing
+                device = next(self.parameters()).device  # Get device from model parameters
+                coords_float = batch['locs_float'].to(device)  # (N_total, 3)
+                feats = batch['feats'].to(device)  # (N_total, C_in)
+                
+                # Combine original features with coordinate features
+                combined_feats = torch.cat((feats, coords_float), 1)  # (N_total, C_in+3)
+                
+                # Handle offsets for batch processing 
+                if 'offsets' in batch:
+                    offsets = batch['offsets'].to(device)  # (B+1,)
+                    B = len(offsets) - 1
+                    
+                    # Convert to dense batched format for transformer
+                    max_points = max([(offsets[i+1] - offsets[i]).item() for i in range(B)])
+                    
+                    # Create dense tensors
+                    xyz_batched = torch.zeros(B, max_points, 3, device=coords_float.device, dtype=coords_float.dtype)
+                    feats_batched = torch.zeros(B, max_points, combined_feats.size(1), 
+                                              device=combined_feats.device, dtype=combined_feats.dtype)
+                    mask_batched = torch.zeros(B, max_points, dtype=torch.bool, device=coords_float.device)
+                    
+                    # Fill batched tensors
+                    for i in range(B):
+                        start, end = offsets[i].item(), offsets[i+1].item()
+                        length = end - start
+                        
+                        # Add error handling for edge cases
+                        if length > max_points:
+                            print(f"[WARN] Truncating points from {length} to {max_points} for batch {i}")
+                            length = max_points
+                            
+                        xyz_batched[i, :length] = coords_float[start:start+length]
+                        feats_batched[i, :length] = combined_feats[start:start+length]
+                        mask_batched[i, :length] = True
+                    
+                    # Create batch dictionary for transformer
+                    transformer_batch = {
+                        'xyz': xyz_batched,
+                        'features': feats_batched, 
+                        'mask': mask_batched,
+                        'offsets': offsets  # Keep original offsets for output reconstruction
+                    }
+                    
+                    # Pass through transformer
+                    output_features = self.backbone(transformer_batch)
+                    
+                    return output_features
+                    
+                else:
+                    # Single sample case
+                    transformer_batch = {
+                        'xyz': coords_float.unsqueeze(0),
+                        'features': combined_feats.unsqueeze(0)
+                    }
+                    output_features = self.backbone(transformer_batch)
+                    return output_features.squeeze(0)
+                    
+            else:
+                # Original RandLANet processing
+                # batch 字典由 collate_fn 准备好，直接送入 backbone
+                # backbone 输出 (B, m, N)
+                output_features_bmn = self.backbone(batch)
 
-        # 将输出调整为 (B*N, m) 以适应下游
-        B, M, N = output_features_bmn.shape
-        return output_features_bmn.permute(0, 2, 1).contiguous().view(-1, M)
+                # 将输出调整为 (B*N, m) 以适应下游
+                B, M, N = output_features_bmn.shape
+                return output_features_bmn.permute(0, 2, 1).contiguous().view(-1, M)
+                
+        except Exception as e:
+            print(f"[ERROR] Encoder failed: {e}")
+            print(f"Backbone type: {self.backbone_type}")
+            if isinstance(batch, dict):
+                print(f"Batch keys: {batch.keys()}")
+                for key, value in batch.items():
+                    if torch.is_tensor(value):
+                        print(f"  {key}: {value.shape}")
+            raise e
 
     def forward(self, batch_l, batch_u=None):
         ret = {}
+        
+        # Get features from encoder
         output_feats_l = self.encoder(batch_l)
-        semantic_scores_l = self.classifier(output_feats_l)
+        
+        # Handle different backbone outputs
+        if self.backbone_type == 'stratified_transformer':
+            # Transformer already outputs class scores
+            semantic_scores_l = output_feats_l
+            # Extract features for projector (use intermediate representation)
+            # For now, we'll use the scores as features - this could be improved
+            # by modifying the transformer to return both features and scores
+            ret['semantic_features_l'] = output_feats_l
+        else:
+            # Traditional flow for RandLANet
+            semantic_scores_l = self.classifier(output_feats_l)
+            ret['semantic_features_l'] = output_feats_l
+            
         ret['semantic_scores_l'] = semantic_scores_l
-        ret['semantic_features_l'] = output_feats_l
 
         if batch_u is not None:
             output_feats_u = self.encoder(batch_u)
-            semantic_scores_u = self.classifier(output_feats_u)
+            
+            if self.backbone_type == 'stratified_transformer':
+                semantic_scores_u = output_feats_u
+                ret['semantic_features_u'] = output_feats_u
+                # For contrastive learning, we need to project the features
+                output_feats_u_proj = self.projector(output_feats_u)
+            else:
+                semantic_scores_u = self.classifier(output_feats_u)
+                ret['semantic_features_u'] = output_feats_u
+                output_feats_u_proj = self.projector(output_feats_u)
+                
             ret['semantic_scores_u'] = semantic_scores_u
-            ret['semantic_features_u'] = output_feats_u
-            output_feats_u = self.projector(output_feats_u)
-            embed_u = F.normalize(output_feats_u, p=2, dim=1)
+            embed_u = F.normalize(output_feats_u_proj, p=2, dim=1)
             ret['embed_u'] = embed_u
 
         return ret
