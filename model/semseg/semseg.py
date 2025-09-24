@@ -292,15 +292,16 @@ class SemSeg(nn.Module):
         try:
             if self.backbone_type == 'stratified_transformer':
                 # Handle StratifiedTransformer with proper data preprocessing
-                coords_float = batch['locs_float'].cuda()  # (N_total, 3)
-                feats = batch['feats'].cuda()  # (N_total, C_in)
+                device = next(self.parameters()).device  # Get device from model parameters
+                coords_float = batch['locs_float'].to(device)  # (N_total, 3)
+                feats = batch['feats'].to(device)  # (N_total, C_in)
                 
                 # Combine original features with coordinate features
                 combined_feats = torch.cat((feats, coords_float), 1)  # (N_total, C_in+3)
                 
                 # Handle offsets for batch processing 
                 if 'offsets' in batch:
-                    offsets = batch['offsets'].cuda()  # (B+1,)
+                    offsets = batch['offsets'].to(device)  # (B+1,)
                     B = len(offsets) - 1
                     
                     # Convert to dense batched format for transformer
